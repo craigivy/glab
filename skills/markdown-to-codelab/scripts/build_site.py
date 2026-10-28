@@ -893,7 +893,15 @@ def escape_html(text: str) -> str:
 
 
 def inline_format(text: str) -> str:
-    """Formats inline Markdown: links, bold, italic, code, strikethrough."""
+    """Formats inline Markdown: code, links, bold, italic, strikethrough."""
+    # 1. Protect inline code first so inner underscores/asterisks are never corrupted
+    inline_codes = []
+    def code_repl(m):
+        idx = len(inline_codes)
+        inline_codes.append(f'<code translate="no" dir="ltr">{escape_html(m.group(1))}</code>')
+        return f"@@@INLINECODEPH{idx}@@@"
+    text = re.sub(r'`([^`]+)`', code_repl, text)
+
     # Strikethrough: ~~text~~
     text = re.sub(r'~~(.*?)~~', r'<del>\1</del>', text)
 
@@ -917,29 +925,21 @@ def inline_format(text: str) -> str:
 
     # Italic: *text* or _text_ (excluding double asterisks or word internal)
     text = re.sub(r'(?<!\*)\*(?!\*)([^\*]+)\*(?!\*)', r'<em>\1</em>', text)
-    text = re.sub(r'(?<!_)_(?!_)([^_]+)_(?!_)', r'<em>\1</em>', text)
+    text = re.sub(r'(?:^|(?<=[\s(]))_([^_]+)_(?=[\s).,;:!?]|$)', r'<em>\1</em>', text)
 
-    # Inline code: `code`
-    def code_repl(m):
-        return f'<code translate="no" dir="ltr">{escape_html(m.group(1))}</code>'
-    text = re.sub(r'`([^`]+)`', code_repl, text)
+    # Restore inline code
+    for idx, ic in enumerate(inline_codes):
+        text = text.replace(f"@@@INLINECODEPH{idx}@@@", ic)
 
     return text
 
 
-def parse_markdown_to_html(md_text: str, source_dir: Path, output_images_dir: Path) -> str:
-    """
-    Parses a single step's Markdown content into Google Codelabs HTML.
-    Protects code blocks, tables, alerts/asides, then handles lists, headings,
-    images, and paragraphs.
-    """
-    code_blocks = []
-    def code_repl(m):
-        lang = m.group(1).strip() or "bash"
-        code = m.group(2).rstrip("\n")
-        idx = len(code_blocks)
-        escaped_code = escape_html(code)
-        block_html = f'''<devsite-code>
+def render_code_block_html(lang: str, code: str) -> str:
+    """Renders a code block into Google Codelabs devsite-code component."""
+    lang = lang.strip() or "bash"
+    code = code.rstrip("\n")
+    escaped_code = escape_html(code)
+    return f'''<devsite-code>
   <div class="code-header">
     <span class="code-lang">{escape_html(lang)}</span>
     <button class="copy-button" onclick="copyCode(this)" aria-label="Copy code">
@@ -949,18 +949,96 @@ def parse_markdown_to_html(md_text: str, source_dir: Path, output_images_dir: Pa
   </div>
   <pre class="devsite-click-to-copy" syntax="{escape_html(lang)}"><code class="language-{escape_html(lang)}">{escaped_code}</code></pre>
 </devsite-code>'''
+
+
+def parse_markdown_to_html(md_text: str, source_dir: Path, output_images_dir: Path) -> str:
+    """
+    Parses a single step's Markdown content into Google Codelabs HTML.
+    Protects alerts/asides, code blocks, tables, then handles lists, headings,
+    images, and paragraphs.
+    """
+    # Step 1: Protect alerts / asides (both GFM > [!NOTE] and DevSite style)
+    # Processed first so code blocks inside alerts have leading '>' prefixes cleanly removed.
+    alert_blocks = []
+    def alert_repl(m):
+        atype = m.group(1).upper()
+        content = m.group(2)
+        lines = [re.sub(r'^[ \t]*>[ \t]?', '', l) for l in content.split("\n")]
+        body_md = "\n".join(lines).strip()
+
+        icon = "info"
+        title = "Note"
+        css_class = "special"
+        if atype in ("IMPORTANT", "CAUTION"):
+            icon = "error_outline"
+            title = "Important"
+            css_class = "special warning"
+        elif atype == "WARNING":
+            icon = "warning"
+            title = "Warning"
+            css_class = "warning"
+        elif atype == "TIP":
+            icon = "lightbulb"
+            title = "Tip"
+            css_class = "special tip"
+
+        # Extract code blocks inside the alert body
+        inner_code_blocks = []
+        def inner_code_repl(cm):
+            c_lang = cm.group(1).strip() or "bash"
+            c_code = cm.group(2)
+            idx = len(inner_code_blocks)
+            inner_code_blocks.append(render_code_block_html(c_lang, c_code))
+            return f"\n\n<!--INNER_CODE_{idx}-->\n\n"
+
+        body_md_masked = re.sub(r'```([a-zA-Z0-9_-]*)\n(.*?)```', inner_code_repl, body_md, flags=re.DOTALL)
+
+        formatted_parts = []
+        for p in body_md_masked.split("\n\n"):
+            p = p.strip()
+            if not p:
+                continue
+            if p.startswith("<!--INNER_CODE_"):
+                formatted_parts.append(p)
+            else:
+                formatted_parts.append(f'<p>{inline_format(p)}</p>')
+
+        body_html = "\n  ".join(formatted_parts)
+        for c_idx, c_html in enumerate(inner_code_blocks):
+            body_html = body_html.replace(f"<!--INNER_CODE_{c_idx}-->", c_html)
+
+        block_html = f'''<aside class="{css_class}">
+  <div class="aside-header"><span class="material-icons">{icon}</span><strong>{title}:</strong></div>
+  {body_html}
+</aside>'''
+        idx = len(alert_blocks)
+        alert_blocks.append(block_html)
+        return f"\n\n<!--ALERT_BLOCK_{idx}-->\n\n"
+
+    text = re.sub(
+        r'(?m)^[ \t]*>[ \t]*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*\n((?:[ \t]*>.*(?:\n|$))+)',
+        alert_repl,
+        md_text
+    )
+
+    # Step 2: Protect code blocks outside alerts
+    code_blocks = []
+    def code_repl(m):
+        lang = m.group(1).strip() or "bash"
+        code = m.group(2)
+        idx = len(code_blocks)
+        block_html = render_code_block_html(lang, code)
         code_blocks.append(block_html)
         return f"\n\n<!--CODE_BLOCK_{idx}-->\n\n"
 
-    # Step 1: Protect code blocks
-    text = re.sub(r'```([a-zA-Z0-9_-]*)\n(.*?)```', code_repl, md_text, flags=re.DOTALL)
+    text = re.sub(r'```([a-zA-Z0-9_-]*)\n(.*?)```', code_repl, text, flags=re.DOTALL)
 
-    # Step 2: Protect tables
+    # Step 3: Protect tables
     table_blocks = []
     def table_repl(m):
         table_raw = m.group(0).strip()
         lines = [l.strip() for l in table_raw.split("\n") if l.strip()]
-        if len(lines) >= 2 and "|" in lines[0] and re.match(r'^\|[-:| ]+\|$', lines[1]):
+        if len(lines) >= 2 and "|" in lines[0] and re.match(r'^\s*\|?\s*[-:| ]+\|\s*$', lines[1]):
             headers = [c.strip() for c in lines[0].strip("|").split("|")]
             rows = []
             for r in lines[2:]:
@@ -982,53 +1060,8 @@ def parse_markdown_to_html(md_text: str, source_dir: Path, output_images_dir: Pa
             return f"\n\n<!--TABLE_BLOCK_{idx}-->\n\n"
         return table_raw
 
-    text = re.sub(r'(\|.*?\|\n\|[-:| ]+\|\n(?:\|.*?\|\n?)+)', table_repl, text)
-
-    # Step 3: Protect alerts / asides (both GFM > [!NOTE] and DevSite style)
-    alert_blocks = []
-    def alert_repl(m):
-        atype = m.group(1).upper()
-        content = m.group(2).strip()
-        lines = [re.sub(r'^>\s?', '', l) for l in content.split("\n")]
-        body_md = "\n".join(lines).strip()
-
-        icon = "info"
-        title = "Note"
-        css_class = "special"
-        if atype in ("IMPORTANT", "CAUTION"):
-            icon = "error_outline"
-            title = "Important"
-            css_class = "special warning"
-        elif atype == "WARNING":
-            icon = "warning"
-            title = "Warning"
-            css_class = "warning"
-        elif atype == "TIP":
-            icon = "lightbulb"
-            title = "Tip"
-            css_class = "special tip"
-
-        formatted_p = []
-        for p in body_md.split("\n\n"):
-            p = p.strip()
-            if p:
-                formatted_p.append(f'<p>{inline_format(p)}</p>')
-        body_html = "".join(formatted_p)
-
-        block_html = f'''<aside class="{css_class}">
-  <div class="aside-header"><span class="material-icons">{icon}</span><strong>{title}:</strong></div>
-  {body_html}
-</aside>'''
-        idx = len(alert_blocks)
-        alert_blocks.append(block_html)
-        return f"\n\n<!--ALERT_BLOCK_{idx}-->\n\n"
-
-    text = re.sub(
-        r'^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*\n((?:>.*(?:\n|$))+)',
-        alert_repl,
-        text,
-        flags=re.MULTILINE
-    )
+    table_pattern = r'(?m)^[ \t]*\|[^\n]+\|[ \t]*\n[ \t]*\|[ \t]*:?[-]+:?[ \t]*(?:\|[ \t]*:?[-]+:?[ \t]*)+\|[ \t]*(?:\n[ \t]*\|[^\n]+\|[ \t]*)+'
+    text = re.sub(table_pattern, table_repl, text)
 
     # Step 4: Images ![alt](src)
     def img_repl(m):
