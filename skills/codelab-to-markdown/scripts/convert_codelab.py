@@ -58,16 +58,15 @@ SYNTAX_MAP = {
 BASH_COMMANDS = (
     'mkdir', 'cd', 'ls', 'curl', 'wget', 'gcloud', 'npm', 'pip', 'pip3',
     'python', 'python3', 'git', 'export', 'source', 'docker', 'kubectl',
-    'agy', 'cat', 'echo', 'rm', 'cp', 'mv', 'chmod', 'chown', 'brew'
+    'agy', 'cat', 'echo', 'rm', 'cp', 'mv', 'chmod', 'chown', 'brew',
+    'agents-cli', 'uv', 'cloudshell', 'jq'
 )
 
-def infer_language(code_str, declared_syntax):
+def infer_language(code_str, declared_syntax, is_guessed=False, attr_lang=""):
     """Refine code block language based on content and declared syntax."""
     s = code_str.strip()
-    declared_clean = declared_syntax.lower().strip() if declared_syntax else "text"
-    mapped = SYNTAX_MAP.get(declared_clean, declared_clean)
 
-    # Check if JSON
+    # 1. Check if JSON
     if s.startswith(('{', '[')):
         try:
             json.loads(s)
@@ -75,38 +74,66 @@ def infer_language(code_str, declared_syntax):
         except Exception:
             pass
 
-    # Check if YAML frontmatter or config
+    # 2. Check if YAML frontmatter or config
     if s.startswith('---') and ('name:' in s or 'description:' in s or 'apiVersion:' in s):
+        if '# ' in s or '## ' in s:
+            return 'markdown'
+        return 'yaml'
+    if any(s.startswith(k) for k in ['metrics_to_run:', 'apiVersion:', 'metadata:', 'spec:']):
         return 'yaml'
 
-    # Check if bash commands
-    first_word = s.split()[0] if s else ""
-    if first_word in BASH_COMMANDS or s.startswith(('$', '#!/bin/bash', '#!/bin/sh', 'lsof', 'grep')):
+    # 3. Check if Python
+    if any(line.startswith(('import ', 'from ', 'def ', 'class ', '@', '"""')) for line in s.splitlines()):
+        if 'def ' in s or 'import ' in s or 'class ' in s or '"""' in s:
+            return 'python'
+
+    # 4. Check attr_lang from code element if specific
+    if attr_lang:
+        clean_attr = attr_lang.lower().replace('language-', '').strip()
+        if clean_attr in SYNTAX_MAP:
+            return SYNTAX_MAP[clean_attr]
+
+    # 5. Check if bash commands
+    first_token = s.split()[0] if s else ""
+    first_token_clean = first_token.lstrip("$(").rstrip(")")
+    if (first_token in BASH_COMMANDS or first_token_clean in BASH_COMMANDS or
+        s.startswith(('$', '#!/bin/bash', '#!/bin/sh', 'lsof', 'grep')) or
+        any(cmd in s for cmd in ['agents-cli ', 'gcloud ', 'cloudshell edit '])):
         return 'bash'
 
-    # Return mapped or text
-    return mapped
+    # 6. Check declared syntax if not guessed
+    if declared_syntax and not is_guessed:
+        clean_dec = declared_syntax.lower().strip()
+        if clean_dec in SYNTAX_MAP:
+            return SYNTAX_MAP[clean_dec]
+
+    return 'text'
 
 def clean_html_text(text):
-    """Strip tags and unescape html entities."""
-    text = re.sub(r'<[^>]+>', '', text)
+    """Strip HTML tags and unescape html entities."""
+    text = re.sub(r'</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^>]*)?>', '', text)
     return html.unescape(text).strip()
 
 def inline_format_html(text):
-    """Convert common inline HTML tags to Markdown."""
-    # Replace inline code
+    """Convert common inline HTML tags to Markdown while preserving inline code."""
+    # 1. Protect inline code so inner content is never altered or tag-stripped
+    inline_codes = []
     def code_repl(m):
-        code_content = html.unescape(m.group(1))
-        return f"`{code_content}`"
+        raw = m.group(1)
+        raw_stripped = re.sub(r'</?(?:span|strong|b|em|i|font|small|var|kbd)\b[^>]*>', '', raw, flags=re.IGNORECASE)
+        code_content = html.unescape(raw_stripped)
+        idx = len(inline_codes)
+        inline_codes.append(f"`{code_content}`")
+        return f"__INLINE_CODE_{idx}__"
     text = re.sub(r'<code\b[^>]*>(.*?)</code>', code_repl, text, flags=re.DOTALL)
 
-    # Replace bold
+    # 2. Replace bold
     text = re.sub(r'<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>', r'**\1**', text, flags=re.DOTALL)
 
-    # Replace italic
+    # 3. Replace italic
     text = re.sub(r'<(?:em|i)\b[^>]*>(.*?)</(?:em|i)>', r'*\1*', text, flags=re.DOTALL)
 
-    # Replace links
+    # 4. Replace links
     def link_repl(m):
         href = m.group(1).strip()
         label = html.unescape(m.group(2)).strip()
@@ -115,8 +142,14 @@ def inline_format_html(text):
         return f"[{label}]({href})"
     text = re.sub(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', link_repl, text, flags=re.DOTALL)
 
-    # Clean leftover span/div/font tags
-    text = re.sub(r'</?(?:span|div|font|var|kbd)[^>]*>', '', text)
+    # 5. Clean leftover span/div/font/var/kbd tags
+    text = re.sub(r'</?(?:span|div|font|var|kbd|small|p)\b[^>]*>', '', text, flags=re.IGNORECASE)
+    text = html.unescape(text)
+
+    # 6. Restore protected inline code
+    for idx, ic in enumerate(inline_codes):
+        text = text.replace(f"__INLINE_CODE_{idx}__", ic)
+
     return text
 
 def parse_metadata(html_content, source_url):
@@ -171,11 +204,14 @@ def parse_metadata(html_content, source_url):
     }
 
 def extract_image_urls(html_content, base_url):
-    """Find all image URLs in the codelab content, ignoring header lockup and chrome."""
-    img_matches = re.findall(r'<img\b[^>]*src="([^"]+)"[^>]*>', html_content)
+    """Find all image URLs inside codelab steps, ignoring header lockup and chrome."""
+    step_blocks = re.findall(r'<google-codelab-step\b[^>]*>(.*?)</google-codelab-step>', html_content, flags=re.DOTALL)
+    content_scope = "".join(step_blocks) if step_blocks else html_content
+
+    img_matches = re.findall(r'<img\b[^>]*src="([^"]+)"[^>]*>', content_scope)
     urls = []
     for src in img_matches:
-        if 'lockup.svg' in src or 'favicon' in src or 'button' in src:
+        if 'lockup' in src or 'favicon' in src or 'button' in src:
             continue
         full_url = urllib.parse.urljoin(base_url, src)
         urls.append((src, full_url))
@@ -194,7 +230,7 @@ def download_image(url, target_path):
         print(f"  [Warning] Failed to download {url}: {e}", file=sys.stderr)
         return False
 
-def download_all_images(img_url_pairs, images_dir):
+def download_all_images(img_url_pairs, images_dir, output_dir=None):
     """Download all images and return mapping from original src to local relative path."""
     os.makedirs(images_dir, exist_ok=True)
     mapping = {}
@@ -208,7 +244,7 @@ def download_all_images(img_url_pairs, images_dir):
                 filename = f"img_{abs(hash(full_url)):x}.png"
 
             target_path = os.path.join(images_dir, filename)
-            rel_path = f"images/{filename}"
+            rel_path = os.path.relpath(target_path, output_dir) if output_dir else f"images/{filename}"
             mapping[original_src] = rel_path
 
             if not os.path.exists(target_path):
@@ -229,10 +265,10 @@ def convert_table_to_markdown(table_html):
     for r in rows:
         headers = re.findall(r'<th\b[^>]*>(.*?)</th>', r, flags=re.DOTALL)
         if headers:
-            table_data.append([inline_format_html(clean_html_text(c)) for c in headers])
+            table_data.append([inline_format_html(c).strip() for c in headers])
         else:
             cells = re.findall(r'<td\b[^>]*>(.*?)</td>', r, flags=re.DOTALL)
-            table_data.append([inline_format_html(clean_html_text(c)) for c in cells])
+            table_data.append([inline_format_html(c).strip() for c in cells])
 
     if not table_data:
         return ""
@@ -263,7 +299,13 @@ def convert_step_body(body_html, image_map):
     def code_repl(m):
         full_tag = m.group(0)
         syntax_m = re.search(r'syntax="([^"]+)"', full_tag, re.IGNORECASE)
+        is_guessed = "syntax-guessed" in full_tag
         declared_syntax = syntax_m.group(1) if syntax_m else "text"
+
+        lang_m = re.search(r'language="language-([^"]+)"', full_tag)
+        if not lang_m:
+            lang_m = re.search(r'class="[^"]*language-([^"\s]+)', full_tag)
+        attr_lang = lang_m.group(1) if lang_m else ""
 
         code_match = re.search(r'<code\b[^>]*>(.*?)</code>', full_tag, flags=re.DOTALL)
         if code_match:
@@ -274,7 +316,7 @@ def convert_step_body(body_html, image_map):
 
         clean_code = re.sub(r'<[^>]+>', '', raw_code)
         unescaped_code = html.unescape(clean_code).rstrip()
-        lang = infer_language(unescaped_code, declared_syntax)
+        lang = infer_language(unescaped_code, declared_syntax, is_guessed, attr_lang)
 
         idx = len(code_blocks)
         fence = f"```{lang}\n{unescaped_code}\n```"
@@ -303,7 +345,7 @@ def convert_step_body(body_html, image_map):
         cls = class_m.group(1).lower() if class_m else ""
 
         alert_type = "NOTE"
-        if "warning" in cls:
+        if "warning" in cls or "caution" in cls:
             alert_type = "WARNING"
         elif "tip" in cls:
             alert_type = "TIP"
@@ -314,18 +356,34 @@ def convert_step_body(body_html, image_map):
         inner_content = re.sub(r'</aside>$', '', inner_content, flags=re.IGNORECASE)
         inner_content = re.sub(r'<div class="aside-header"[^>]*>.*?</div>', '', inner_content, flags=re.DOTALL)
 
-        paras = re.findall(r'<p\b[^>]*>(.*?)</p>', inner_content, flags=re.DOTALL)
-        if not paras:
-            paras = [inner_content]
+        # Convert paragraphs inside aside
+        def aside_p_repl(pm):
+            return f"\n\n{inline_format_html(pm.group(1)).strip()}\n\n"
+        inner_md = re.sub(r'<p\b[^>]*>(.*?)</p>', aside_p_repl, inner_content, flags=re.DOTALL)
 
+        # Clean leftover tags inside aside
+        inner_md = re.sub(r'</?(?:div|span|section|article|header|footer)[^>]*>', '', inner_md)
+        inner_md = inline_format_html(inner_md)
+
+        # Substitute any code placeholders inside aside directly
+        for c_idx, cb in enumerate(code_blocks):
+            if f"__CODE_PLACEHOLDER_{c_idx}__" in inner_md:
+                inner_md = inner_md.replace(f"__CODE_PLACEHOLDER_{c_idx}__", cb)
+
+        # Build quoted alert lines
+        blocks = [b.strip() for b in re.split(r'\n{2,}', inner_md) if b.strip()]
         aside_lines = [f"> [!{alert_type}]"]
-        for p in paras:
-            p_text = clean_html_text(inline_format_html(p))
-            if p_text:
-                for line in p_text.split('\n'):
-                    line_s = line.strip()
-                    if line_s:
-                        aside_lines.append(f"> {line_s}")
+        for block in blocks:
+            for line in block.splitlines():
+                line_r = line.rstrip()
+                if line_r:
+                    aside_lines.append(f"> {line_r}")
+                else:
+                    aside_lines.append(">")
+            aside_lines.append(">")
+        # Remove trailing empty quote
+        if aside_lines and aside_lines[-1] == ">":
+            aside_lines.pop()
 
         idx = len(asides)
         asides.append("\n".join(aside_lines))
@@ -354,9 +412,17 @@ def convert_step_body(body_html, image_map):
     body = re.sub(r'<h2\b[^>]*class="step-title"[^>]*>.*?</h2>', '', body, flags=re.DOTALL)
 
     # Convert upgraded h2 or h3 to ###
-    body = re.sub(r'<h2\b[^>]*>(.*?)</h2>', r'\n\n### \1\n\n', body, flags=re.DOTALL)
-    body = re.sub(r'<h3\b[^>]*>(.*?)</h3>', r'\n\n### \1\n\n', body, flags=re.DOTALL)
-    body = re.sub(r'<h4\b[^>]*>(.*?)</h4>', r'\n\n#### \1\n\n', body, flags=re.DOTALL)
+    def heading_repl(level):
+        def repl(m):
+            h_text = m.group(1)
+            clean_h = inline_format_html(h_text).strip()
+            prefix = "#" * level
+            return f"\n\n{prefix} {clean_h}\n\n"
+        return repl
+
+    body = re.sub(r'<h2\b[^>]*>(.*?)</h2>', heading_repl(3), body, flags=re.DOTALL)
+    body = re.sub(r'<h3\b[^>]*>(.*?)</h3>', heading_repl(3), body, flags=re.DOTALL)
+    body = re.sub(r'<h4\b[^>]*>(.*?)</h4>', heading_repl(4), body, flags=re.DOTALL)
 
     # 6. Lists
     def list_repl(m):
@@ -365,7 +431,7 @@ def convert_step_body(body_html, image_map):
         items = re.findall(r'<li\b[^>]*>(.*?)</li>', list_html, flags=re.DOTALL)
         md_items = []
         for i, item in enumerate(items):
-            clean_item = clean_html_text(inline_format_html(item))
+            clean_item = inline_format_html(item).strip()
             prefix = f"{i+1}." if is_ol else "-"
             md_items.append(f"{prefix} {clean_item}")
         return "\n\n" + "\n".join(md_items) + "\n\n"
@@ -376,27 +442,24 @@ def convert_step_body(body_html, image_map):
     def p_repl(m):
         p_html = m.group(1)
         clean_p = inline_format_html(p_html).strip()
-        clean_p = re.sub(r'<[^>]+>', '', clean_p)
-        clean_p = html.unescape(clean_p)
         return f"\n\n{clean_p}\n\n"
 
     body = re.sub(r'<p\b[^>]*>(.*?)</p>', p_repl, body, flags=re.DOTALL)
 
     # 8. Clean up stray HTML containers
     body = re.sub(r'</?(?:div|span|section|article|header|footer|button|iframe)[^>]*>', '', body)
-    body = inline_format_html(body)
 
     # 9. Clean multiple blank lines
     blocks = [b.strip() for b in re.split(r'\n{2,}', body) if b.strip()]
     cleaned_body = "\n\n".join(blocks)
 
-    # 10. Restore placeholders
-    for idx, cb in enumerate(code_blocks):
-        cleaned_body = cleaned_body.replace(f"__CODE_PLACEHOLDER_{idx}__", cb)
-    for idx, tb in enumerate(tables):
-        cleaned_body = cleaned_body.replace(f"__TABLE_PLACEHOLDER_{idx}__", tb)
+    # 10. Restore placeholders (asides first, then tables, then code blocks)
     for idx, ab in enumerate(asides):
         cleaned_body = cleaned_body.replace(f"__ASIDE_PLACEHOLDER_{idx}__", ab)
+    for idx, tb in enumerate(tables):
+        cleaned_body = cleaned_body.replace(f"__TABLE_PLACEHOLDER_{idx}__", tb)
+    for idx, cb in enumerate(code_blocks):
+        cleaned_body = cleaned_body.replace(f"__CODE_PLACEHOLDER_{idx}__", cb)
 
     return cleaned_body
 
@@ -430,11 +493,18 @@ def convert_codelab(source, output_path="lab.md", images_dir=None, base_url="htt
     if not skip_images:
         img_pairs = extract_image_urls(raw_html, base_url)
         print(f"Found {len(img_pairs)} content images. Downloading to {images_dir}...")
-        image_map = download_all_images(img_pairs, images_dir)
+        image_map = download_all_images(img_pairs, images_dir, output_dir=output_dir)
         print(f"Successfully processed {len(image_map)} images.")
 
     # 4. Extract steps
     step_matches = list(re.finditer(r'<google-codelab-step\s+([^>]+)>(.*?)</google-codelab-step>', raw_html, flags=re.DOTALL))
+    if not step_matches:
+        print(f"\n[Warning] No codelab steps (<google-codelab-step>) found in '{source}'.", file=sys.stderr)
+        if source.rstrip('/') == 'https://codelabs.developers.google.com':
+            print("Note: 'https://codelabs.developers.google.com/' is the Google Codelabs catalog index page, not an individual lab.", file=sys.stderr)
+            print("Please provide a specific codelab URL, for example:\n  https://codelabs.developers.google.com/getting-started-google-antigravity\n", file=sys.stderr)
+        return ""
+
     print(f"Found {len(step_matches)} steps.")
 
     md_sections = []
@@ -451,7 +521,8 @@ def convert_codelab(source, output_path="lab.md", images_dir=None, base_url="htt
         step_body_md = convert_step_body(body, image_map)
 
         # Header for the step
-        step_header = f"## {i+1}. {label}\n"
+        clean_label = re.sub(r'^\d+[\.\:\-\s]*\s*', '', label) or label
+        step_header = f"## {i+1}. {clean_label}\n"
         if i == 0:
             note = f"> [!NOTE]\n> This lab is based on [{metadata['title']}]({metadata['source_url']}).\n"
             md_sections.append(f"{step_header}\n{note}\n{step_body_md}")
