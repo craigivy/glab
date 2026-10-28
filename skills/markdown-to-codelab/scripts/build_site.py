@@ -347,7 +347,7 @@ a:hover {
 }
 
 /* Callouts / Asides */
-aside.special {
+aside, aside.special, aside.warning {
   margin: 24px 0;
   padding: 16px 20px;
   border-radius: 0 8px 8px 0;
@@ -356,7 +356,7 @@ aside.special {
   color: var(--google-grey-900);
 }
 
-aside.special .aside-header {
+aside .aside-header, aside.special .aside-header, aside.warning .aside-header {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -366,16 +366,16 @@ aside.special .aside-header {
   color: #174ea6;
 }
 
-aside.special .aside-header .material-icons {
+aside .aside-header .material-icons, aside.special .aside-header .material-icons, aside.warning .aside-header .material-icons {
   font-size: 20px;
 }
 
-aside.special p {
+aside p, aside.special p, aside.warning p {
   margin-bottom: 8px;
   color: #1a237e;
 }
 
-aside.special p:last-child {
+aside p:last-child, aside.special p:last-child, aside.warning p:last-child {
   margin-bottom: 0;
 }
 
@@ -392,16 +392,16 @@ aside.special.warning p, aside.warning p {
   color: #5c3b00;
 }
 
-aside.special.tip {
+aside.special.tip, aside.tip {
   border-left-color: #1e8e3e;
   background-color: #e6f4ea;
 }
 
-aside.special.tip .aside-header {
+aside.special.tip .aside-header, aside.tip .aside-header {
   color: #137333;
 }
 
-aside.special.tip p {
+aside.special.tip p, aside.tip p {
   color: #0d5322;
 }
 
@@ -976,7 +976,7 @@ def parse_markdown_to_html(md_text: str, source_dir: Path, output_images_dir: Pa
         elif atype == "WARNING":
             icon = "warning"
             title = "Warning"
-            css_class = "warning"
+            css_class = "special warning"
         elif atype == "TIP":
             icon = "lightbulb"
             title = "Tip"
