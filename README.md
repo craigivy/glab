@@ -16,6 +16,47 @@ Both skills are designed to work seamlessly with **Google Antigravity** and othe
 
 ---
 
+## TL;DR
+
+### 1. Install the Skills
+
+Install globally for Google Antigravity / Gemini CLI agents (or run the standalone Python scripts with zero external dependencies):
+
+```bash
+mkdir -p ~/.gemini/antigravity-cli/skills
+cp -r skills/* ~/.gemini/antigravity-cli/skills/
+```
+
+### 2. Example Usage
+
+#### A. Codelab → Markdown (`codelab-to-markdown`)
+Fetch a live Google Codelab, download images locally, and generate clean `lab.md`:
+
+- **Agent Prompt**:
+  > *"Convert `https://codelabs.developers.google.com/<slug>` into `lab.md`"*
+
+#### B. Markdown → Codelab Website (`markdown-to-codelab`)
+Compile your Markdown tutorial into an interactive Google Codelabs static site in `docs/`:
+
+- **Agent Prompt**:
+  > *"Build an interactive codelab site in `docs/` from `lab.md`"*
+
+### 3. Deploy to GitHub Pages (`main` branch & `/docs` directory)
+
+Publish your interactive codelab instantly using GitHub Pages:
+
+1. **Configure GitHub Pages**:
+   - **Commit and push** the generated `docs/` directory to the `main` branch.
+   - In your GitHub repo, navigate to **Settings** → **Pages**.
+   - Under **Build and deployment**:
+     - **Source**: Select `Deploy from a branch`.
+     - **Branch**: Select `main`.
+     - **Folder**: Select `/docs`.
+   - Click **Save**.
+2. **Access your live lab**: Your site is published at `https://<username>.github.io/<repo>/`.
+
+---
+
 ## Architecture & Workflow
 
 ```mermaid
